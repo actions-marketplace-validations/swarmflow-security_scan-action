@@ -1,0 +1,15 @@
+# Example consumer workflow.
+# Copy this into your repo as .github/workflows/swarmflow.yml
+# and add a repo secret named SWARMFLOW_API_KEY.
+name: SwarmFlow Security Gate
+on: [push, pull_request]
+
+jobs:
+  security-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: SwarmFlow Security Gate
+        uses: swarmflow-security/scan-action@v1
+        with:
+          api-key: ${{ secrets.SWARMFLOW_API_KEY }}
+          threshold: high

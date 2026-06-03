@@ -1,0 +1,128 @@
+name: 'SwarmFlow Security Gate'
+description: 'Fail your CI build when SwarmFlow finds code-security issues at or above a severity threshold.'
+author: 'SwarmFlow'
+branding:
+  icon: 'shield'
+  color: 'blue'
+
+inputs:
+  api-key:
+    description: 'SwarmFlow API key (create one in Settings → API Keys). Store it as a repo secret and pass it here, e.g. ${{ secrets.SWARMFLOW_API_KEY }}.'
+    required: true
+  threshold:
+    description: "Minimum severity that fails the build: critical | high | medium | low."
+    required: false
+    default: 'high'
+  repo-url:
+    description: 'Repository URL to evaluate. Defaults to the current GitHub repository.'
+    required: false
+    default: ''
+  api-url:
+    description: 'SwarmFlow API base URL. Override only for self-hosted/staging.'
+    required: false
+    default: 'https://swarmflow-production.up.railway.app'
+  fail-on-error:
+    description: "If 'true', a failed gate (or API error) fails the build. Set 'false' to report only."
+    required: false
+    default: 'true'
+
+outputs:
+  passed:
+    description: "'true' if no findings at/above the threshold, otherwise 'false'."
+    value: ${{ steps.gate.outputs.passed }}
+  critical:
+    description: 'Number of critical findings.'
+    value: ${{ steps.gate.outputs.critical }}
+  high:
+    description: 'Number of high findings.'
+    value: ${{ steps.gate.outputs.high }}
+  medium:
+    description: 'Number of medium findings.'
+    value: ${{ steps.gate.outputs.medium }}
+  low:
+    description: 'Number of low findings.'
+    value: ${{ steps.gate.outputs.low }}
+
+runs:
+  using: 'composite'
+  steps:
+    - id: gate
+      shell: bash
+      env:
+        SWARMFLOW_API_KEY: ${{ inputs.api-key }}
+        SWARMFLOW_THRESHOLD: ${{ inputs.threshold }}
+        SWARMFLOW_API_URL: ${{ inputs.api-url }}
+        SWARMFLOW_REPO_URL: ${{ inputs.repo-url }}
+        SWARMFLOW_FAIL_ON_ERROR: ${{ inputs.fail-on-error }}
+        GH_SERVER_URL: ${{ github.server_url }}
+        GH_REPOSITORY: ${{ github.repository }}
+      run: |
+        set -euo pipefail
+
+        if [ -z "${SWARMFLOW_API_KEY}" ]; then
+          echo "::error::Missing 'api-key'. Create one in SwarmFlow → Settings → API Keys and pass it as \${{ secrets.SWARMFLOW_API_KEY }}."
+          exit 1
+        fi
+
+        REPO_URL="${SWARMFLOW_REPO_URL}"
+        if [ -z "${REPO_URL}" ]; then
+          REPO_URL="${GH_SERVER_URL}/${GH_REPOSITORY}"
+        fi
+
+        echo "🛡  SwarmFlow Security Gate"
+        echo "   Repo:      ${REPO_URL}"
+        echo "   Threshold: ${SWARMFLOW_THRESHOLD}"
+
+        # Call the gate endpoint. -s silent, -w to capture HTTP status, fail soft so we can handle errors.
+        HTTP_BODY=$(mktemp)
+        HTTP_CODE=$(curl -sS -o "${HTTP_BODY}" -w '%{http_code}' \
+          -H "Authorization: Bearer ${SWARMFLOW_API_KEY}" \
+          "${SWARMFLOW_API_URL}/api/ci/gate?repoUrl=$(printf '%s' "${REPO_URL}" | sed 's/ /%20/g')&threshold=${SWARMFLOW_THRESHOLD}" || echo "000")
+
+        RESP="$(cat "${HTTP_BODY}")"
+        echo "   HTTP ${HTTP_CODE}"
+
+        # Handle transport / auth / server errors.
+        if [ "${HTTP_CODE}" != "200" ]; then
+          MSG=$(printf '%s' "${RESP}" | jq -r '.message // empty' 2>/dev/null || true)
+          echo "::error::SwarmFlow gate request failed (HTTP ${HTTP_CODE})${MSG:+: ${MSG}}"
+          if [ "${SWARMFLOW_FAIL_ON_ERROR}" = "true" ]; then exit 1; else exit 0; fi
+        fi
+
+        PASSED=$(printf '%s' "${RESP}" | jq -r '.passed // false')
+        CRIT=$(printf '%s' "${RESP}"   | jq -r '.counts.critical // 0')
+        HIGH=$(printf '%s' "${RESP}"   | jq -r '.counts.high // 0')
+        MED=$(printf '%s' "${RESP}"    | jq -r '.counts.medium // 0')
+        LOW=$(printf '%s' "${RESP}"    | jq -r '.counts.low // 0')
+
+        {
+          echo "passed=${PASSED}"
+          echo "critical=${CRIT}"
+          echo "high=${HIGH}"
+          echo "medium=${MED}"
+          echo "low=${LOW}"
+        } >> "${GITHUB_OUTPUT}"
+
+        # Markdown summary in the GitHub Actions run.
+        {
+          echo "## 🛡 SwarmFlow Security Gate"
+          echo ""
+          echo "**Repository:** \`${REPO_URL}\`  "
+          echo "**Threshold:** \`${SWARMFLOW_THRESHOLD}\`  "
+          echo "**Result:** $([ "${PASSED}" = "true" ] && echo '✅ Passed' || echo '❌ Failed')"
+          echo ""
+          echo "| Severity | Count |"
+          echo "|----------|-------|"
+          echo "| 🔴 Critical | ${CRIT} |"
+          echo "| 🟠 High | ${HIGH} |"
+          echo "| 🟡 Medium | ${MED} |"
+          echo "| 🔵 Low | ${LOW} |"
+        } >> "${GITHUB_STEP_SUMMARY}"
+
+        if [ "${PASSED}" = "true" ]; then
+          echo "✅ Gate passed — no findings at or above '${SWARMFLOW_THRESHOLD}'."
+          exit 0
+        fi
+
+        echo "::error::SwarmFlow gate failed — findings at or above '${SWARMFLOW_THRESHOLD}' (critical=${CRIT}, high=${HIGH})."
+        if [ "${SWARMFLOW_FAIL_ON_ERROR}" = "true" ]; then exit 1; else exit 0; fi
